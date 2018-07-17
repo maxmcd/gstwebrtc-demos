@@ -17,14 +17,13 @@ extern crate lazy_static;
 use failure::Error;
 use gst::prelude::*;
 use rand::Rng;
-use std::cmp::Ordering;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use websocket::message::OwnedMessage;
 
-const STUN_SERVER: &'static str = "stun://stun.l.google.com:19302 ";
+const STUN_SERVER: &str = "stun://stun.l.google.com:19302 ";
 lazy_static! {
-    static ref RTP_CAPS_OPUS: gst::GstRc<gst::CapsRef> = {
+    static ref RTP_CAPS_OPUS: gst::Caps = {
         gst::Caps::new_simple(
             "application/x-rtp",
             &[
@@ -34,7 +33,7 @@ lazy_static! {
             ],
         )
     };
-    static ref RTP_CAPS_VP8: gst::GstRc<gst::CapsRef> = {
+    static ref RTP_CAPS_VP8: gst::Caps = {
         gst::Caps::new_simple(
             "application/x-rtp",
             &[
@@ -46,9 +45,9 @@ lazy_static! {
     };
 }
 
-#[derive(PartialEq, PartialOrd, Eq, Debug, Clone, Ord)]
+#[derive(PartialEq, PartialOrd, Eq, Debug, Copy, Clone, Ord)]
 enum AppState {
-    AppStateErr = 1,
+    Error = 1,
     ServerConnected,
     ServerRegistering = 2000,
     ServerRegisteringError,
@@ -76,7 +75,7 @@ enum JsonMsg {
     },
 }
 
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum MediaType {
     Audio,
     Video,
@@ -108,18 +107,11 @@ struct WsError(AppState);
 struct BusError(String);
 
 #[derive(Debug, Fail)]
-#[fail(display = "Error linking pads {:?} != {:?}", left, right)]
-struct PadLinkError {
-    left: gst::PadLinkReturn,
-    right: gst::PadLinkReturn,
-}
-
-#[derive(Debug, Fail)]
 #[fail(display = "Missing elements {:?}", _0)]
 struct MissingElements(Vec<&'static str>);
 
 fn check_plugins() -> Result<(), Error> {
-    let needed = vec![
+    let needed = [
         "opus",
         "vpx",
         "nice",
@@ -130,47 +122,49 @@ fn check_plugins() -> Result<(), Error> {
         "videotestsrc",
         "audiotestsrc",
     ];
+
     let registry = gst::Registry::get();
-    let mut missing: Vec<&'static str> = Vec::new();
-    for plugin_name in needed {
-        let plugin = registry.find_plugin(&plugin_name.to_string());
-        if plugin.is_none() {
-            missing.push(plugin_name)
-        }
-    }
-    if missing.len() > 0 {
+    let missing = needed
+        .iter()
+        .filter(|n| registry.find_plugin(n).is_none())
+        .map(|n| *n)
+        .collect::<Vec<_>>();
+
+    if !missing.is_empty() {
         Err(MissingElements(missing))?
     } else {
         Ok(())
     }
 }
 
-fn send_sdp_offer(app_control: &AppControl, offer: gst_webrtc::WebRTCSessionDescription) {
-    if app_control.app_state_cmp(
+fn send_sdp_offer(app_control: &AppControl, offer: &gst_webrtc::WebRTCSessionDescription) {
+    if !app_control.assert_app_state_is_at_least(
         AppState::PeerCallNegotiating,
         "Can't send offer, not in call",
-    ) == Ordering::Less
-    {
+    ) {
         return;
     }
+
     let message = serde_json::to_string(&JsonMsg::Sdp {
         type_: "offer".to_string(),
         sdp: offer.get_sdp().as_text().unwrap(),
     }).unwrap();
-    app_control.send_text_msg(message.to_string());
+
+    app_control.send_text_msg(message);
 }
 
 fn on_offer_created(
     app_control: &AppControl,
-    webrtc: gst::Element,
+    webrtc: &gst::Element,
     promise: &gst::Promise,
 ) -> Result<(), Error> {
-    if !app_control.app_state_eq(
+    if !app_control.assert_app_state_is(
         AppState::PeerCallNegotiating,
-        "Not negotiation call when creating offer",
+        "Not negotiating call when creating offer",
     ) {
         return Ok(());
     }
+
     let reply = promise.get_reply().unwrap();
 
     let offer = reply
@@ -180,19 +174,23 @@ fn on_offer_created(
         .expect("Invalid argument");
     webrtc.emit("set-local-description", &[&offer, &None::<gst::Promise>])?;
 
-    send_sdp_offer(&app_control, offer);
+    send_sdp_offer(&app_control, &offer);
+
     Ok(())
 }
 
 fn on_negotiation_needed(app_control: &AppControl, values: &[glib::Value]) -> Result<(), Error> {
     app_control.0.lock().unwrap().app_state = AppState::PeerCallNegotiating;
+
     let webrtc = values[0].get::<gst::Element>().unwrap();
     let webrtc_clone = webrtc.clone();
     let app_control_clone = app_control.clone();
     let promise = gst::Promise::new_with_change_func(move |promise| {
-        on_offer_created(&app_control_clone, webrtc, promise).unwrap();
+        on_offer_created(&app_control_clone, &webrtc, promise).unwrap();
     });
+
     webrtc_clone.emit("create-offer", &[&None::<gst::Structure>, &promise])?;
+
     Ok(())
 }
 
@@ -209,17 +207,22 @@ fn handle_media_stream(
             let conv = gst::ElementFactory::make("audioconvert", None).unwrap();
             let sink = gst::ElementFactory::make("autoaudiosink", None).unwrap();
             let resample = gst::ElementFactory::make("audioresample", None).unwrap();
+
             pipe.add_many(&[&q, &conv, &resample, &sink])?;
             gst::Element::link_many(&[&q, &conv, &resample, &sink])?;
+
             resample.sync_state_with_parent()?;
+
             (q, conv, sink)
         }
         MediaType::Video => {
             let q = gst::ElementFactory::make("queue", None).unwrap();
             let conv = gst::ElementFactory::make("videoconvert", None).unwrap();
             let sink = gst::ElementFactory::make("autovideosink", None).unwrap();
+
             pipe.add_many(&[&q, &conv, &sink])?;
             gst::Element::link_many(&[&q, &conv, &sink])?;
+
             (q, conv, sink)
         }
     };
@@ -228,14 +231,8 @@ fn handle_media_stream(
     sink.sync_state_with_parent()?;
 
     let qpad = q.get_static_pad("sink").unwrap();
-    let ret = pad.link(&qpad);
-    let ok = gst::PadLinkReturn::Ok;
-    if ret != ok {
-        Err(PadLinkError {
-            left: ret,
-            right: ok,
-        })?;
-    }
+    pad.link(&qpad).into_result()?;
+
     Ok(())
 }
 
@@ -252,20 +249,21 @@ fn on_incoming_decodebin_stream(
 
     let caps = pad.get_current_caps().unwrap();
     let name = caps.get_structure(0).unwrap().get_name();
-    match if name.starts_with("video") {
+
+    let handled = if name.starts_with("video") {
         handle_media_stream(&pad, &pipe, MediaType::Video)
     } else if name.starts_with("audio") {
         handle_media_stream(&pad, &pipe, MediaType::Audio)
     } else {
         println!("Unknown pad {:?}, ignoring", pad);
         Ok(())
-    } {
-        Ok(()) => return None,
-        Err(err) => {
-            app_control.send_bus_error(format!("Error adding pad with caps {} {:?}", name, err));
-            return None;
-        }
     };
+
+    if let Err(err) = handled {
+        app_control.send_bus_error(&format!("Error adding pad with caps {} {:?}", name, err));
+    }
+
+    None
 }
 
 fn on_incoming_stream(
@@ -274,6 +272,7 @@ fn on_incoming_stream(
     pipe: &gst::Pipeline,
 ) -> Option<glib::Value> {
     let webrtc = values[0].get::<gst::Element>().expect("Invalid argument");
+
     let decodebin = gst::ElementFactory::make("decodebin", None).unwrap();
     let pipe_clone = pipe.clone();
     let app_control_clone = app_control.clone();
@@ -282,41 +281,46 @@ fn on_incoming_stream(
             on_incoming_decodebin_stream(&app_control_clone, values, &pipe_clone)
         })
         .unwrap();
-    pipe.clone()
-        .dynamic_cast::<gst::Bin>()
-        .unwrap()
-        .add(&decodebin)
-        .unwrap();
+
+    pipe.add(&decodebin).unwrap();
+
     decodebin.sync_state_with_parent().unwrap();
     webrtc.link(&decodebin).unwrap();
+
     None
 }
 
 fn send_ice_candidate_message(app_control: &AppControl, values: &[glib::Value]) {
-    if app_control.app_state_cmp(AppState::PeerCallNegotiating, "Can't send ICE, not in call")
-        == Ordering::Less
+    if !app_control
+        .assert_app_state_is_at_least(AppState::PeerCallNegotiating, "Can't send ICE, not in call")
     {
         return;
     }
+
     let _webrtc = values[0].get::<gst::Element>().expect("Invalid argument");
     let mlineindex = values[1].get::<u32>().expect("Invalid argument");
     let candidate = values[2].get::<String>().expect("Invalid argument");
+
     let message = serde_json::to_string(&JsonMsg::Ice {
-        candidate: candidate,
+        candidate,
         sdp_mline_index: mlineindex,
     }).unwrap();
-    app_control.send_text_msg(message.to_string());
+
+    app_control.send_text_msg(message);
 }
 
 fn add_video_source(pipeline: &gst::Pipeline, webrtcbin: &gst::Element) -> Result<(), Error> {
     let videotestsrc = gst::ElementFactory::make("videotestsrc", None).unwrap();
-    videotestsrc.set_property_from_str("pattern", "ball");
     let videoconvert = gst::ElementFactory::make("videoconvert", None).unwrap();
     let queue = gst::ElementFactory::make("queue", None).unwrap();
     let vp8enc = gst::ElementFactory::make("vp8enc", None).unwrap();
-    vp8enc.set_property("deadline", &1i64)?;
+
+    videotestsrc.set_property_from_str("pattern", "ball");
+    vp8enc.set_property("deadline", &1i64).unwrap();
+
     let rtpvp8pay = gst::ElementFactory::make("rtpvp8pay", None).unwrap();
     let queue2 = gst::ElementFactory::make("queue", None).unwrap();
+
     pipeline.add_many(&[
         &videotestsrc,
         &videoconvert,
@@ -325,6 +329,7 @@ fn add_video_source(pipeline: &gst::Pipeline, webrtcbin: &gst::Element) -> Resul
         &rtpvp8pay,
         &queue2,
     ])?;
+
     gst::Element::link_many(&[
         &videotestsrc,
         &videoconvert,
@@ -333,13 +338,14 @@ fn add_video_source(pipeline: &gst::Pipeline, webrtcbin: &gst::Element) -> Resul
         &rtpvp8pay,
         &queue2,
     ])?;
+
     queue2.link_filtered(webrtcbin, &*RTP_CAPS_VP8)?;
+
     Ok(())
 }
 
 fn add_audio_source(pipeline: &gst::Pipeline, webrtcbin: &gst::Element) -> Result<(), Error> {
     let audiotestsrc = gst::ElementFactory::make("audiotestsrc", None).unwrap();
-    audiotestsrc.set_property_from_str("wave", "red-noise");
     let queue = gst::ElementFactory::make("queue", None).unwrap();
     let audioconvert = gst::ElementFactory::make("audioconvert", None).unwrap();
     let audioresample = gst::ElementFactory::make("audioresample", None).unwrap();
@@ -347,6 +353,9 @@ fn add_audio_source(pipeline: &gst::Pipeline, webrtcbin: &gst::Element) -> Resul
     let opusenc = gst::ElementFactory::make("opusenc", None).unwrap();
     let rtpopuspay = gst::ElementFactory::make("rtpopuspay", None).unwrap();
     let queue3 = gst::ElementFactory::make("queue", None).unwrap();
+
+    audiotestsrc.set_property_from_str("wave", "red-noise");
+
     pipeline.add_many(&[
         &audiotestsrc,
         &queue,
@@ -357,6 +366,7 @@ fn add_audio_source(pipeline: &gst::Pipeline, webrtcbin: &gst::Element) -> Resul
         &rtpopuspay,
         &queue3,
     ])?;
+
     gst::Element::link_many(&[
         &audiotestsrc,
         &queue,
@@ -367,31 +377,34 @@ fn add_audio_source(pipeline: &gst::Pipeline, webrtcbin: &gst::Element) -> Resul
         &rtpopuspay,
         &queue3,
     ])?;
+
     queue3.link_filtered(webrtcbin, &*RTP_CAPS_OPUS)?;
+
     Ok(())
 }
 
 impl AppControl {
-    fn app_state_eq(&self, state: AppState, error_msg: &'static str) -> bool {
-        if { self.0.lock().unwrap().app_state != state } {
-            self.send_bus_error(String::from(error_msg));
+    fn assert_app_state_is(&self, state: AppState, error_msg: &'static str) -> bool {
+        if self.0.lock().unwrap().app_state != state {
+            self.send_bus_error(error_msg);
+
             false
         } else {
             true
         }
     }
 
-    fn app_state_cmp(&self, state: AppState, error_msg: &'static str) -> Ordering {
-        match { self.0.lock().unwrap().app_state.cmp(&state) } {
-            Ordering::Less => {
-                self.send_bus_error(String::from(error_msg));
-                Ordering::Less
-            }
-            _foo => _foo,
+    fn assert_app_state_is_at_least(&self, state: AppState, error_msg: &'static str) -> bool {
+        if self.0.lock().unwrap().app_state < state {
+            self.send_bus_error(error_msg);
+
+            false
+        } else {
+            true
         }
     }
 
-    fn send_bus_error(&self, body: String) {
+    fn send_bus_error(&self, body: &str) {
         let mbuilder =
             gst::Message::new_application(gst::Structure::new("error", &[("body", &body)]));
         let _ = self.0.lock().unwrap().bus.post(&mbuilder.build());
@@ -412,21 +425,22 @@ impl AppControl {
 
     fn construct_pipeline(&self) -> Result<gst::Pipeline, Error> {
         let pipeline = { self.0.lock().unwrap().pipeline.clone() };
+
         let webrtcbin = gst::ElementFactory::make("webrtcbin", "sendrecv").unwrap();
         pipeline.add(&webrtcbin)?;
+
         webrtcbin.set_property_from_str("stun-server", STUN_SERVER);
+
         add_video_source(&pipeline, &webrtcbin)?;
         add_audio_source(&pipeline, &webrtcbin)?;
+
         Ok(pipeline)
     }
 
     fn start_pipeline(&self) -> Result<(), Error> {
         let pipe = self.construct_pipeline()?;
-        let webrtc = pipe.clone()
-            .dynamic_cast::<gst::Bin>()
-            .unwrap()
-            .get_by_name("sendrecv")
-            .unwrap();
+        let webrtc = pipe.get_by_name("sendrecv").unwrap();
+
         let app_control_clone = self.clone();
         webrtc.connect("on-negotiation-needed", false, move |values| {
             on_negotiation_needed(&app_control_clone, values).unwrap();
@@ -446,12 +460,15 @@ impl AppControl {
         })?;
 
         pipe.set_state(gst::State::Playing).into_result()?;
+
         self.0.lock().unwrap().webrtc = Some(webrtc);
+
         Ok(())
     }
 
     fn register_with_server(&self) {
         self.update_state(AppState::ServerRegistering);
+
         let our_id = rand::thread_rng().gen_range(10, 10_000);
         println!("Registering id {} with server", our_id);
         self.send_text_msg(format!("HELLO {}", our_id));
@@ -459,6 +476,7 @@ impl AppControl {
 
     fn setup_call(&self) {
         self.update_state(AppState::PeerConnecting);
+
         let peer_id = { self.0.lock().unwrap().peer_id.clone() };
         println!("Setting up signalling server call with {}", peer_id);
         self.send_text_msg(format!("SESSION {}", peer_id));
@@ -471,10 +489,13 @@ impl AppControl {
                 return Err(OutOfOrder("Received HELLO when not registering"))?;
             }
         }
+
         self.update_state(AppState::ServerRegistered);
         self.setup_call();
+
         Ok(())
     }
+
     fn handle_session_ok(&self) -> Result<(), Error> {
         {
             let mut app_control = self.0.lock().unwrap();
@@ -483,8 +504,10 @@ impl AppControl {
             }
             app_control.app_state = AppState::PeerConnected;
         }
+
         self.start_pipeline()
     }
+
     fn handle_error(&self) -> Result<(), Error> {
         let app_control = self.0.lock().unwrap();
         let error = match app_control.app_state {
@@ -495,24 +518,27 @@ impl AppControl {
             AppState::ServerRegisteringError => AppState::ServerRegisteringError,
             AppState::PeerConnectionError => AppState::PeerConnectionError,
             AppState::PeerCallError => AppState::PeerCallError,
-            AppState::AppStateErr => AppState::AppStateErr,
-            AppState::ServerConnected => AppState::AppStateErr,
-            AppState::ServerRegistered => AppState::AppStateErr,
-            AppState::PeerCallStarted => AppState::AppStateErr,
+            AppState::Error => AppState::Error,
+            AppState::ServerConnected => AppState::Error,
+            AppState::ServerRegistered => AppState::Error,
+            AppState::PeerCallStarted => AppState::Error,
         };
-        return Err(WsError(error))?;
+
+        Err(WsError(error))?
     }
-    fn handle_sdp(&self, type_: String, sdp: String) {
-        if !self.app_state_eq(AppState::PeerCallNegotiating, "Not ready to handle sdp") {
+
+    fn handle_sdp(&self, type_: &str, sdp: &str) {
+        if !self.assert_app_state_is(AppState::PeerCallNegotiating, "Not ready to handle sdp") {
             return;
         }
 
         if type_ != "answer" {
-            self.send_bus_error(String::from("Sdp type is not \"anser\""));
+            self.send_bus_error("Sdp type is not \"answer\"");
             return;
         }
 
         let mut app_control = self.0.lock().unwrap();
+
         print!("Received answer:\n{}\n", sdp);
 
         let ret = gst_sdp::SDPMessage::parse_buffer(sdp.as_bytes()).unwrap();
@@ -525,9 +551,11 @@ impl AppControl {
             .unwrap()
             .emit("set-remote-description", &[&answer, &promise])
             .unwrap();
+
         app_control.app_state = AppState::PeerCallStarted;
     }
-    fn handle_ice(&self, sdp_mline_index: u32, candidate: String) {
+
+    fn handle_ice(&self, sdp_mline_index: u32, candidate: &str) {
         let app_control = self.0.lock().unwrap();
         app_control
             .webrtc
@@ -536,45 +564,56 @@ impl AppControl {
             .emit("add-ice-candidate", &[&sdp_mline_index, &candidate])
             .unwrap();
     }
-    fn on_message(&mut self, msg: String) -> Result<(), Error> {
-        if msg == "HELLO" {
-            return self.handle_hello();
-        }
-        if msg == "SESSION_OK" {
-            return self.handle_session_ok();
-        }
 
-        if msg.starts_with("ERROR") {
-            println!("Got error message! {}", msg);
-            return self.handle_error();
+    fn on_message(&self, msg: &str) -> Result<(), Error> {
+        match msg {
+            "HELLO" => self.handle_hello(),
+
+            "SESSION_OK" => self.handle_session_ok(),
+
+            x if x.starts_with("ERROR") => {
+                println!("Got error message! {}", msg);
+                self.handle_error()
+            }
+
+            _ => {
+                let json_msg: JsonMsg = serde_json::from_str(msg)?;
+
+                match json_msg {
+                    JsonMsg::Sdp { type_, sdp } => self.handle_sdp(&type_, &sdp),
+                    JsonMsg::Ice {
+                        sdp_mline_index,
+                        candidate,
+                    } => self.handle_ice(sdp_mline_index, &candidate),
+                };
+
+                Ok(())
+            }
         }
-        let json_msg: JsonMsg = serde_json::from_str(&msg)?;
-        match json_msg {
-            JsonMsg::Sdp { type_, sdp } => self.handle_sdp(type_, sdp),
-            JsonMsg::Ice {
-                sdp_mline_index,
-                candidate,
-            } => self.handle_ice(sdp_mline_index, candidate),
-        };
-        Ok(())
     }
 
-    fn close_and_quit(&self, err: Error) {
-        let app_control = self.0.lock().unwrap();
+    fn close_and_quit(&self, err: &Error) {
         println!("{}\nquitting", err);
-        app_control
-            .pipeline
-            .set_state(gst::State::Null)
-            .into_result()
-            .ok();
-        app_control
-            .send_msg_tx
-            .send(OwnedMessage::Close(Some(websocket::message::CloseData {
-                status_code: 1011, //Internal Error
-                reason: err.to_string(),
-            })))
-            .ok();
-        app_control.main_loop.quit();
+
+        // Must not hold mutex while shutting down the pipeline
+        // as something might call into here and take the mutex too
+        let (pipeline, main_loop) = {
+            let app_control = self.0.lock().unwrap();
+
+            app_control
+                .send_msg_tx
+                .send(OwnedMessage::Close(Some(websocket::message::CloseData {
+                    status_code: 1011, //Internal Error
+                    reason: err.to_string(),
+                })))
+                .unwrap();
+
+            (app_control.pipeline.clone(), app_control.main_loop.clone())
+        };
+
+        pipeline.set_state(gst::State::Null).into_result().unwrap();
+
+        main_loop.quit();
     }
 }
 
@@ -595,10 +634,13 @@ fn parse_args() -> (String, String) {
                 .takes_value(true),
         )
         .get_matches();
+
     let server = matches
         .value_of("server")
         .unwrap_or("wss://webrtc.nirbheek.in:8443");
+
     let peer_id = matches.value_of("peer-id").unwrap();
+
     (server.to_string(), peer_id.to_string())
 }
 
@@ -614,17 +656,15 @@ fn send_loop(
                 return;
             }
         };
-        match msg {
-            OwnedMessage::Close(_) => {
-                let _ = sender.send_message(&msg);
-                return;
-            }
-            _ => (),
+
+        if let OwnedMessage::Close(_) = msg {
+            let _ = sender.send_message(&msg);
+            return;
         }
-        match sender.send_message(&msg) {
-            Ok(()) => (),
-            Err(err) => println!("Error sending {:?}", err),
-        };
+
+        if let Err(err) = sender.send_message(&msg) {
+            println!("Error sending {:?}", err);
+        }
     })
 }
 
@@ -646,18 +686,20 @@ fn receive_loop(
                     return;
                 }
             };
+
             match message {
                 OwnedMessage::Close(_) => {
                     let _ = send_msg_tx.send(OwnedMessage::Close(None));
                     return;
                 }
-                OwnedMessage::Ping(data) => match send_msg_tx.send(OwnedMessage::Pong(data)) {
-                    Ok(()) => (),
-                    Err(e) => {
+
+                OwnedMessage::Ping(data) => {
+                    if let Err(e) = send_msg_tx.send(OwnedMessage::Pong(data)) {
                         println!("Receive Loop error: {:?}", e);
                         return;
                     }
-                },
+                }
+
                 OwnedMessage::Text(msg) => {
                     let mbuilder = gst::Message::new_application(gst::Structure::new(
                         "ws-message",
@@ -675,7 +717,7 @@ fn receive_loop(
 }
 
 fn handle_application_msg(
-    app_control: &mut AppControl,
+    app_control: &AppControl,
     struc: &gst::StructureRef,
 ) -> Result<(), Error> {
     match struc.get_name() {
@@ -683,13 +725,14 @@ fn handle_application_msg(
             let msg = struc.get_value("body").unwrap();
             app_control.on_message(msg.get().unwrap())
         }
-        "ws-error" => Err(WsError(app_control.0.lock().unwrap().app_state.clone()))?,
+        "ws-error" => Err(WsError(app_control.0.lock().unwrap().app_state))?,
         "error" => {
             let msg: String = struc.get_value("body").unwrap().get().unwrap();
             Err(BusError(msg))?
         }
-        _u => {
-            println!("Got unknown application message {:?}", _u);
+        u => {
+            println!("Got unknown application message {:?}", u);
+
             Ok(())
         }
     }
@@ -697,12 +740,9 @@ fn handle_application_msg(
 
 fn main() {
     gst::init().unwrap();
-    match check_plugins() {
-        Err(err) => {
-            println!("{:?}", err);
-            return;
-        }
-        _ => {}
+    if let Err(err) = check_plugins() {
+        println!("{:?}", err);
+        return;
     }
 
     let (server, peer_id) = parse_args();
@@ -733,8 +773,8 @@ fn main() {
 
     let app_control = AppControl(Arc::new(Mutex::new(AppControlInner {
         webrtc: None,
-        pipeline: pipeline,
-        send_msg_tx: send_msg_tx,
+        pipeline,
+        send_msg_tx,
         bus: bus.clone(),
         main_loop: main_loop.clone(),
         peer_id: peer_id.to_string(),
@@ -743,22 +783,23 @@ fn main() {
     app_control.register_with_server();
 
     bus.add_watch(move |_, msg| {
-        let mut app_control = app_control.clone();
         use gst::message::MessageView;
+
+        let app_control = app_control.clone();
         match msg.view() {
-            MessageView::Error(err) => app_control.close_and_quit(Error::from(err.get_error())),
+            MessageView::Error(err) => app_control.close_and_quit(&Error::from(err.get_error())),
             MessageView::Warning(warning) => {
                 println!("Warning: \"{}\"", warning.get_debug().unwrap());
             }
             MessageView::Application(a) => {
                 let struc = a.get_structure().unwrap();
-                match handle_application_msg(&mut app_control, struc) {
-                    Err(err) => app_control.close_and_quit(err),
-                    _ => {}
-                };
+                if let Err(err) = handle_application_msg(&app_control, struc) {
+                    app_control.close_and_quit(&err)
+                }
             }
             _ => {}
         };
+
         glib::Continue(true)
     });
 
